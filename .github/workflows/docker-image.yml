@@ -8,7 +8,7 @@ on:
       - 'Dockerfile' # Only trigger if Dockerfile changes
   workflow_dispatch: # Allows manual trigger from GitHub UI
   schedule:
-    - cron: '30 9 * * *' # Your current schedule: daily at 09:30 UTC
+    - cron: '30 9 * * *' # Daily at 09:30 UTC
 
 env:
   IMAGE_NAME: caddy-cloudflare # Your repository name
@@ -50,13 +50,6 @@ jobs:
           echo "Current upstream digest for ${UPSTREAM_FULL_IMAGE_RUNTIME}: ${UPSTREAM_DIGEST}"
           echo "UPSTREAM_DIGEST=${UPSTREAM_DIGEST}" >> $GITHUB_OUTPUT
 
-      - name: Restore last known upstream digest from cache
-        id: cache_digest
-        uses: actions/cache/restore@v4
-        with:
-          path: ./.last_upstream_digest
-          key: ${{ runner.os }}-upstream-digest-${{ env.UPSTREAM_IMAGE_NAME }}-${{ env.UPSTREAM_IMAGE_TAG }}
-
       - name: Compare digests and determine if build is required
         id: compare
         run: |
@@ -66,7 +59,7 @@ jobs:
             LAST_UPSTREAM_DIGEST=$(cat "$LAST_DIGEST_FILE")
             echo "Last known upstream digest: ${LAST_UPSTREAM_DIGEST}"
           else
-            echo "No last known upstream digest file found. This is likely the first run for this image or cache miss."
+            echo "No last known upstream digest file found. This is likely the first run."
           fi
 
           CURRENT_UPSTREAM_DIGEST="${{ steps.upstream_digest.outputs.UPSTREAM_DIGEST }}"
@@ -106,13 +99,12 @@ jobs:
           echo "Successfully pushed images:"
           echo "${{ steps.meta.outputs.tags }}"
 
-      - name: Create digest file for cache
+      - name: Update digest file and commit to repository
         if: steps.compare.outputs.BUILD_REQUIRED == 'true'
-        run: echo "${{ steps.upstream_digest.outputs.UPSTREAM_DIGEST }}" > ./.last_upstream_digest
-
-      - name: Save current upstream digest to cache (Conditional)
-        if: steps.compare.outputs.BUILD_REQUIRED == 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ./.last_upstream_digest
-          key: ${{ runner.os }}-upstream-digest-${{ env.UPSTREAM_IMAGE_NAME }}-${{ env.UPSTREAM_IMAGE_TAG }}
+        run: |
+          echo "${{ steps.upstream_digest.outputs.UPSTREAM_DIGEST }}" > ./.last_upstream_digest
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add ./.last_upstream_digest
+          git commit -m "Update upstream digest to ${{ steps.upstream_digest.outputs.UPSTREAM_DIGEST }}"
+          git push
