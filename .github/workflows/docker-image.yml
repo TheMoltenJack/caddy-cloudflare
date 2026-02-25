@@ -3,18 +3,16 @@ name: Build and Push Docker Image (Upstream Check)
 on:
   push:
     branches:
-      - main # Trigger on pushes to the main branch
+      - main
     paths:
-      - 'Dockerfile' # Only trigger if Dockerfile changes
-  workflow_dispatch: # Allows manual trigger from GitHub UI
+      - 'Dockerfile'
+  workflow_dispatch:
   schedule:
-    - cron: '30 9 * * *' # Daily at 09:30 UTC
+    - cron: '30 9 * * *'
 
 env:
-  IMAGE_NAME: caddy-cloudflare # Your repository name
+  IMAGE_NAME: caddy-cloudflare
   REGISTRY: ghcr.io
-  GITHUB_USERNAME: TheMoltenJack # Your GitHub username
-
   UPSTREAM_IMAGE_NAME: caddy
   UPSTREAM_IMAGE_TAG: latest
 
@@ -22,7 +20,7 @@ jobs:
   check_and_build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       packages: write
 
     steps:
@@ -38,74 +36,92 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ env.GITHUB_USERNAME }}
+          username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Get current upstream image digest
+      - name: Get upstream image digest
         id: upstream_digest
         run: |
-          UPSTREAM_FULL_IMAGE_RUNTIME="${{ env.UPSTREAM_IMAGE_NAME }}:${{ env.UPSTREAM_IMAGE_TAG }}"
-          echo "Pulling ${UPSTREAM_FULL_IMAGE_RUNTIME} to get its digest..."
-          UPSTREAM_DIGEST=$(docker buildx imagetools inspect --format '{{.Digest}}' "${UPSTREAM_FULL_IMAGE_RUNTIME}" | head -n 1)
-          echo "Current upstream digest for ${UPSTREAM_FULL_IMAGE_RUNTIME}: ${UPSTREAM_DIGEST}"
+          UPSTREAM_FULL_IMAGE="${{ env.UPSTREAM_IMAGE_NAME }}:${{ env.UPSTREAM_IMAGE_TAG }}"
+          echo "Inspecting ${UPSTREAM_FULL_IMAGE}..."
+
+          # Extract the linux/amd64 specific digest from the manifest list
+          # to avoid false negatives from a stable top-level manifest digest
+          UPSTREAM_DIGEST=$(docker buildx imagetools inspect "${UPSTREAM_FULL_IMAGE}" \
+            --format '{{range .Manifest.Manifests}}{{if and (eq .Platform.OS "linux") (eq .Platform.Architecture "amd64")}}{{.Digest}}{{end}}{{end}}' \
+            | tr -d '[:space:]')
+
+          if [ -z "$UPSTREAM_DIGEST" ]; then
+            echo "ERROR: Failed to retrieve upstream digest. Aborting."
+            exit 1
+          fi
+
+          echo "Upstream linux/amd64 digest: ${UPSTREAM_DIGEST}"
           echo "UPSTREAM_DIGEST=${UPSTREAM_DIGEST}" >> $GITHUB_OUTPUT
 
-      - name: Compare digests and determine if build is required
+      - name: Get last built digest from GHCR
+        id: last_digest
+        run: |
+          FULL_IMAGE="${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest"
+          echo "Inspecting last pushed image: ${FULL_IMAGE}..."
+
+          # Pull the stored base digest label from the previously pushed image.
+          # If the image doesn't exist yet (first run), this will return empty.
+          LAST_DIGEST=$(docker buildx imagetools inspect "${FULL_IMAGE}" \
+            --format '{{index .Manifest.Annotations "org.opencontainers.image.base.digest"}}' \
+            2>/dev/null | tr -d '[:space:]' || echo "")
+
+          if [ -z "$LAST_DIGEST" ]; then
+            echo "No previously pushed image found or no base digest annotation present. First run or annotation missing."
+            LAST_DIGEST="none"
+          fi
+
+          echo "Last known base digest from GHCR: ${LAST_DIGEST}"
+          echo "LAST_DIGEST=${LAST_DIGEST}" >> $GITHUB_OUTPUT
+
+      - name: Compare digests
         id: compare
         run: |
-          LAST_DIGEST_FILE="./.last_upstream_digest"
-          LAST_UPSTREAM_DIGEST="none"
-          if [ -f "$LAST_DIGEST_FILE" ]; then
-            LAST_UPSTREAM_DIGEST=$(cat "$LAST_DIGEST_FILE")
-            echo "Last known upstream digest: ${LAST_UPSTREAM_DIGEST}"
-          else
-            echo "No last known upstream digest file found. This is likely the first run."
-          fi
+          CURRENT="${{ steps.upstream_digest.outputs.UPSTREAM_DIGEST }}"
+          LAST="${{ steps.last_digest.outputs.LAST_DIGEST }}"
 
-          CURRENT_UPSTREAM_DIGEST="${{ steps.upstream_digest.outputs.UPSTREAM_DIGEST }}"
+          echo "Current upstream digest : ${CURRENT}"
+          echo "Last built base digest  : ${LAST}"
 
-          if [ "$CURRENT_UPSTREAM_DIGEST" != "$LAST_UPSTREAM_DIGEST" ]; then
-            echo "Upstream image digest has changed or is new. Proceeding with build."
+          if [ "$CURRENT" != "$LAST" ]; then
+            echo "Digest has changed or image is new. Build required."
             echo "BUILD_REQUIRED=true" >> $GITHUB_OUTPUT
           else
-            echo "Upstream image digest has NOT changed. Skipping build."
+            echo "Digest unchanged. Skipping build."
             echo "BUILD_REQUIRED=false" >> $GITHUB_OUTPUT
           fi
-          echo "BUILD_REQUIRED=true" >> $GITHUB_OUTPUT
 
-      - name: Get Docker metadata (Conditional)
+      - name: Get Docker metadata
         id: meta
         if: steps.compare.outputs.BUILD_REQUIRED == 'true'
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.GITHUB_USERNAME }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest
             type=sha,format=long
 
-      - name: Build and push Docker image (Conditional)
+      - name: Build and push Docker image
         if: steps.compare.outputs.BUILD_REQUIRED == 'true'
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.base.digest=${{ steps.upstream_digest.outputs.UPSTREAM_DIGEST }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Verify pushed image (Conditional)
+      - name: Verify pushed image
         if: steps.compare.outputs.BUILD_REQUIRED == 'true'
         run: |
-          echo "Successfully pushed images:"
+          echo "Successfully pushed:"
           echo "${{ steps.meta.outputs.tags }}"
-
-      - name: Update digest file and commit to repository
-        if: steps.compare.outputs.BUILD_REQUIRED == 'true'
-        run: |
-          echo "${{ steps.upstream_digest.outputs.UPSTREAM_DIGEST }}" > ./.last_upstream_digest
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add ./.last_upstream_digest
-          git commit -m "Update upstream digest to ${{ steps.upstream_digest.outputs.UPSTREAM_DIGEST }}"
-          git push
+          echo "Stored base digest annotation: ${{ steps.upstream_digest.outputs.UPSTREAM_DIGEST }}"
