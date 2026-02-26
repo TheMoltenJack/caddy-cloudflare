@@ -39,14 +39,33 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Get upstream image digest
+      - name: Restore cached upstream digest
+        id: cache_digest
+        uses: actions/cache/restore@v4
+        with:
+          path: .upstream_digest
+          key: upstream-digest-placeholder
+          restore-keys: |
+            upstream-digest-
+
+      - name: Get last known digest from cache
+        id: last_digest
+        run: |
+          if [ -f ".upstream_digest" ]; then
+            LAST_DIGEST=$(cat .upstream_digest | tr -d '[:space:]')
+            echo "Last known digest from cache: ${LAST_DIGEST}"
+          else
+            LAST_DIGEST="none"
+            echo "No cached digest found. Treating as first run."
+          fi
+          echo "LAST_DIGEST=${LAST_DIGEST}" >> $GITHUB_OUTPUT
+
+      - name: Get current upstream image digest
         id: upstream_digest
         run: |
           UPSTREAM_FULL_IMAGE="${{ env.UPSTREAM_IMAGE_NAME }}:${{ env.UPSTREAM_IMAGE_TAG }}"
           echo "Inspecting ${UPSTREAM_FULL_IMAGE}..."
 
-          # Extract the linux/amd64 specific digest from the manifest list
-          # to avoid false negatives from a stable top-level manifest digest
           UPSTREAM_DIGEST=$(docker buildx imagetools inspect "${UPSTREAM_FULL_IMAGE}" \
             --format '{{range .Manifest.Manifests}}{{if and (eq .Platform.OS "linux") (eq .Platform.Architecture "amd64")}}{{.Digest}}{{end}}{{end}}' \
             | tr -d '[:space:]')
@@ -56,28 +75,8 @@ jobs:
             exit 1
           fi
 
-          echo "Upstream linux/amd64 digest: ${UPSTREAM_DIGEST}"
+          echo "Current upstream linux/amd64 digest: ${UPSTREAM_DIGEST}"
           echo "UPSTREAM_DIGEST=${UPSTREAM_DIGEST}" >> $GITHUB_OUTPUT
-
-      - name: Get last built digest from GHCR
-        id: last_digest
-        run: |
-          FULL_IMAGE="${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest"
-          echo "Inspecting last pushed image: ${FULL_IMAGE}..."
-
-          # Pull the stored base digest label from the previously pushed image.
-          # If the image doesn't exist yet (first run), this will return empty.
-          LAST_DIGEST=$(docker buildx imagetools inspect "${FULL_IMAGE}" \
-            --format '{{index .Manifest.Annotations "org.opencontainers.image.base.digest"}}' \
-            2>/dev/null | tr -d '[:space:]' || echo "")
-
-          if [ -z "$LAST_DIGEST" ]; then
-            echo "No previously pushed image found or no base digest annotation present. First run or annotation missing."
-            LAST_DIGEST="none"
-          fi
-
-          echo "Last known base digest from GHCR: ${LAST_DIGEST}"
-          echo "LAST_DIGEST=${LAST_DIGEST}" >> $GITHUB_OUTPUT
 
       - name: Compare digests
         id: compare
@@ -86,7 +85,7 @@ jobs:
           LAST="${{ steps.last_digest.outputs.LAST_DIGEST }}"
 
           echo "Current upstream digest : ${CURRENT}"
-          echo "Last built base digest  : ${LAST}"
+          echo "Last built digest       : ${LAST}"
 
           if [ "$CURRENT" != "$LAST" ]; then
             echo "Digest has changed or image is new. Build required."
@@ -113,9 +112,7 @@ jobs:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          labels: |
-            ${{ steps.meta.outputs.labels }}
-            org.opencontainers.image.base.digest=${{ steps.upstream_digest.outputs.UPSTREAM_DIGEST }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -124,4 +121,15 @@ jobs:
         run: |
           echo "Successfully pushed:"
           echo "${{ steps.meta.outputs.tags }}"
-          echo "Stored base digest annotation: ${{ steps.upstream_digest.outputs.UPSTREAM_DIGEST }}"
+
+      - name: Save new digest to file
+        if: steps.compare.outputs.BUILD_REQUIRED == 'true'
+        run: |
+          echo "${{ steps.upstream_digest.outputs.UPSTREAM_DIGEST }}" > .upstream_digest
+
+      - name: Update cache with new digest
+        if: steps.compare.outputs.BUILD_REQUIRED == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .upstream_digest
+          key: upstream-digest-${{ steps.upstream_digest.outputs.UPSTREAM_DIGEST }}
