@@ -67,7 +67,7 @@ jobs:
           echo "Inspecting ${UPSTREAM_FULL_IMAGE}..."
 
           UPSTREAM_DIGEST=$(docker buildx imagetools inspect "${UPSTREAM_FULL_IMAGE}" \
-            --format '{{range .Manifest.Manifests}}{{if and (eq .Platform.OS "linux") (eq .Platform.Architecture "amd64")}}{{.Digest}}{{end}}{{end}}' \
+            --format '{{.Manifest.Digest}}' \
             | tr -d '[:space:]')
 
           if [ -z "$UPSTREAM_DIGEST" ]; then
@@ -75,7 +75,7 @@ jobs:
             exit 1
           fi
 
-          echo "Current upstream linux/amd64 digest: ${UPSTREAM_DIGEST}"
+          echo "Current upstream index digest: ${UPSTREAM_DIGEST}"
           echo "UPSTREAM_DIGEST=${UPSTREAM_DIGEST}" >> $GITHUB_OUTPUT
 
       - name: Compare digests
@@ -87,7 +87,7 @@ jobs:
           echo "Current upstream digest : ${CURRENT}"
           echo "Last built digest       : ${LAST}"
 
-          if [ "$CURRENT" != "$LAST" ]; then
+          if [ "$CURRENT" != "$LAST" ] || [ "${{ github.event_name }}" != "schedule" ]; then
             echo "Digest has changed or image is new. Build required."
             echo "BUILD_REQUIRED=true" >> $GITHUB_OUTPUT
           else
@@ -111,6 +111,7 @@ jobs:
         with:
           context: .
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
